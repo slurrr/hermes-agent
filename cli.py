@@ -10480,20 +10480,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             logger.debug("Edit snapshot capture failed for %s", function_name, exc_info=True)
 
     def _on_tool_complete(self, tool_call_id: str, function_name: str, function_args: dict, function_result: str):
-        """Render file edits with inline diff after write-capable tools complete."""
-        snapshot = self._pending_edit_snapshots.pop(tool_call_id, None)
-        try:
-            from agent.display import render_edit_diff_with_delta
+        """Render file edits and play CLI TTS audio after tools complete."""
+        if function_name == "text_to_speech":
+            self._play_tts_tool_result_async(function_result)
 
-            render_edit_diff_with_delta(
-                function_name,
-                function_result,
-                function_args=function_args,
-                snapshot=snapshot,
-                print_fn=_cprint,
-            )
+        snapshot = self._pending_edit_snapshots.pop(tool_call_id, None)
+        if self._inline_diffs_enabled:
+            try:
+                from agent.display import render_edit_diff_with_delta
+
+                render_edit_diff_with_delta(
+                    function_name,
+                    function_result,
+                    function_args=function_args,
+                    snapshot=snapshot,
+                    print_fn=_cprint,
+                )
+            except Exception:
+                logger.debug("Edit diff preview failed for %s", function_name, exc_info=True)
+
+    def _play_tts_tool_result_async(self, function_result: str) -> None:
+        """Play successful text_to_speech tool output in the classic CLI."""
+        try:
+            import json as _json
+            payload = _json.loads(function_result) if isinstance(function_result, str) else function_result
+            if not isinstance(payload, dict) or not payload.get("success"):
+                return
+            audio_path = str(payload.get("file_path") or "").strip()
+            if not audio_path or not os.path.exists(audio_path):
+                return
         except Exception:
-            logger.debug("Edit diff preview failed for %s", function_name, exc_info=True)
+            return
+
+        def _play() -> None:
+            try:
+                from tools.voice_mode import play_audio_file
+                play_audio_file(audio_path)
+            except Exception:
+                logger.debug("CLI TTS playback failed for %s", audio_path, exc_info=True)
+
+        threading.Thread(target=_play, daemon=True, name="hermes-tts-tool-playback").start()
 
     # ====================================================================
     # Voice mode methods
@@ -10671,8 +10697,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 self._attached_images.clear()
                 if hasattr(self, '_app') and self._app:
                     self._app.invalidate()
-                self._pending_input.put(transcript)
-                submitted = True
+                if self._voice_transcript_mode() == "draft":
+                    self._draft_voice_transcript(transcript)
+                    _cprint(f"{_DIM}Voice transcript drafted. Press Enter to send or edit first.{_RST}")
+                    submitted = True
+                    with self._voice_lock:
+                        self._voice_continuous = False
+                else:
+                    self._pending_input.put(transcript)
+                    submitted = True
             elif result.get("success"):
                 _cprint(f"{_DIM}No speech detected.{_RST}")
             else:
@@ -10706,7 +10739,6 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     self._voice_continuous = False
                     self._no_speech_count = 0
                     _cprint(f"{_DIM}No speech detected 3 times, continuous mode stopped.{_RST}")
-                    return
             else:
                 self._no_speech_count = 0
 
@@ -10723,6 +10755,46 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                     except Exception as e:
                         _cprint(f"{_DIM}Voice auto-restart failed: {e}{_RST}")
                 threading.Thread(target=_restart_recording, daemon=True).start()
+
+    def _voice_transcript_mode(self) -> str:
+        """Return whether voice transcripts are auto-sent or inserted as drafts."""
+        try:
+            from hermes_cli.config import load_config
+            voice_cfg = load_config().get("voice", {})
+            if isinstance(voice_cfg, dict):
+                mode = str(voice_cfg.get("transcript_mode") or "send").strip().lower()
+                if mode in {"draft", "edit", "compose"}:
+                    return "draft"
+        except Exception:
+            pass
+        return "send"
+
+    def _draft_voice_transcript(self, transcript: str) -> None:
+        """Insert a voice transcript into the current prompt buffer for editing."""
+        if not transcript or not getattr(self, "_app", None):
+            return
+
+        def _apply() -> None:
+            try:
+                buf = self._app.current_buffer
+                prefix = ""
+                if buf.text and buf.cursor_position > 0:
+                    prev = buf.text[buf.cursor_position - 1]
+                    if not prev.isspace():
+                        prefix = " "
+                buf.insert_text(prefix + transcript)
+                self._app.invalidate()
+            except Exception:
+                pass
+
+        try:
+            loop = getattr(self._app, "loop", None)
+            if loop is not None and getattr(loop, "is_running", lambda: False)():
+                loop.call_soon_threadsafe(_apply)
+                return
+        except Exception:
+            pass
+        _apply()
 
     def _voice_speak_response_async(self, text: str) -> None:
         """Schedule TTS and mark it pending before continuous recording can restart."""
@@ -11553,9 +11625,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             self._reasoning_shown_this_turn = False
 
             # --- Streaming TTS setup ---
-            # When ElevenLabs is the TTS provider and sounddevice is available,
-            # we stream audio sentence-by-sentence as the agent generates tokens
-            # instead of waiting for the full response.
+            # Voice TTS can speak assistant text sentence-by-sentence while the
+            # model is still streaming. ElevenLabs uses native audio chunks;
+            # OpenAI-compatible local providers (e.g. Kokoro) synthesize and
+            # play one completed text chunk at a time.
             use_streaming_tts = False
             _streaming_box_opened = False
             text_queue = None
@@ -11569,14 +11642,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                         _load_tts_config as _load_tts_cfg,
                         _get_provider as _get_prov,
                         _import_elevenlabs,
-                        _import_sounddevice,
                         stream_tts_to_speaker,
                     )
                     _tts_cfg = _load_tts_cfg()
-                    if _get_prov(_tts_cfg) == "elevenlabs":
-                        # Verify both ElevenLabs SDK and audio output are available
+                    _tts_provider = _get_prov(_tts_cfg)
+                    if _tts_provider == "elevenlabs":
                         _import_elevenlabs()
-                        _import_sounddevice()
+                        use_streaming_tts = True
+                    elif _tts_provider == "openai":
                         use_streaming_tts = True
                 except (ImportError, OSError):
                     pass

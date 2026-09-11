@@ -185,6 +185,7 @@ export interface ConfigVoiceConfig {
   // Raw `yaml.safe_load()` value from config; may be non-string if hand-edited.
   // Callers must normalize/validate at runtime (parseVoiceRecordKey()).
   record_key?: unknown
+  transcript_mode?: unknown
 }
 
 export interface ConfigFullResponse {
@@ -634,7 +635,7 @@ export type GatewayEvent =
       type: 'billing.step_up.verification'
     }
   | { payload?: { state?: 'idle' | 'listening' | 'transcribing' }; session_id?: string; type: 'voice.status' }
-  | { payload?: { no_speech_limit?: boolean; text?: string }; session_id?: string; type: 'voice.transcript' }
+  | { payload?: { no_speech_limit?: boolean; text?: string; transcript_mode?: string }; session_id?: string; type: 'voice.transcript' }
   | { payload?: { reason?: string }; session_id?: string; type: 'dashboard.new_session_requested' }
   | { payload: { line: string }; session_id?: string; type: 'gateway.stderr' }
   | {

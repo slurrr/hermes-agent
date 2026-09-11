@@ -796,31 +796,20 @@ def speak_text(text: str) -> None:
         if not tts_text:
             return
 
-        # MP3 output path, pre-chosen so we can play the MP3 directly even
-        # when text_to_speech_tool auto-converts to OGG for messaging
-        # platforms.  afplay's OGG support is flaky, MP3 always works.
-        os.makedirs(os.path.join(tempfile.gettempdir(), "hermes_voice"), exist_ok=True)
-        mp3_path = os.path.join(
-            tempfile.gettempdir(),
-            "hermes_voice",
-            f"tts_{time.strftime('%Y%m%d_%H%M%S')}.mp3",
-        )
+        _debug(f"speak_text: synthesizing {len(tts_text)} chars")
+        import json as _json
+        result = _json.loads(text_to_speech_tool(text=tts_text))
+        audio_path = str(result.get("file_path") or "") if result.get("success") else ""
 
-        _debug(f"speak_text: synthesizing {len(tts_text)} chars -> {mp3_path}")
-        text_to_speech_tool(text=tts_text, output_path=mp3_path)
-
-        if os.path.isfile(mp3_path) and os.path.getsize(mp3_path) > 0:
-            _debug(f"speak_text: playing {mp3_path} ({os.path.getsize(mp3_path)} bytes)")
-            play_audio_file(mp3_path)
+        if audio_path and os.path.isfile(audio_path) and os.path.getsize(audio_path) > 0:
+            _debug(f"speak_text: playing {audio_path} ({os.path.getsize(audio_path)} bytes)")
+            play_audio_file(audio_path)
             try:
-                os.unlink(mp3_path)
-                ogg_path = mp3_path.rsplit(".", 1)[0] + ".ogg"
-                if os.path.isfile(ogg_path):
-                    os.unlink(ogg_path)
+                os.unlink(audio_path)
             except OSError:
                 pass
         else:
-            _debug(f"speak_text: TTS tool produced no audio at {mp3_path}")
+            _debug(f"speak_text: TTS tool produced no audio: {result}")
     except Exception as e:
         logger.warning("Voice TTS playback failed: %s", e)
         _debug(f"speak_text raised {type(e).__name__}: {e}")

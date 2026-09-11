@@ -6547,6 +6547,7 @@ def _(rid, params: dict) -> dict:
     session, err = _sess(params, rid)
     if err:
         return err
+    _stop_session_streaming_tts(session)
     if hasattr(session["agent"], "interrupt"):
         session["agent"].interrupt()
     # Scope the pending-prompt release to THIS session.  A global
@@ -6864,6 +6865,7 @@ def _(rid, params: dict) -> dict:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
                     print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
+        _stop_session_streaming_tts(session)
         session["running"] = True
         session["last_active"] = time.time()
         _start_inflight_turn(session, text)
@@ -7106,6 +7108,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
         goal_followup = None  # set by the post-turn goal hook below
+        tts_text_queue = None
+        tts_stop_event = None
+        tts_done_event = None
+        tts_thread = None
+        streaming_tts_active = False
         try:
             from tools.approval import (
                 reset_current_session_key,
@@ -7130,6 +7137,28 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             cols = session.get("cols", 80)
             streamer = make_stream_renderer(cols)
             prompt = text
+
+            if _voice_tts_enabled():
+                try:
+                    from tools.tts_tool import stream_tts_to_speaker
+
+                    tts_text_queue = queue.Queue()
+                    tts_stop_event = threading.Event()
+                    tts_done_event = threading.Event()
+                    with session["history_lock"]:
+                        session["_voice_tts_stop_event"] = tts_stop_event
+                    tts_thread = threading.Thread(
+                        target=stream_tts_to_speaker,
+                        args=(tts_text_queue, tts_stop_event, tts_done_event),
+                        daemon=True,
+                    )
+                    tts_thread.start()
+                    streaming_tts_active = True
+                except Exception as exc:
+                    print(
+                        f"[tui_gateway] streaming voice TTS unavailable: {exc}",
+                        file=sys.stderr,
+                    )
 
             if isinstance(prompt, str) and "@" in prompt:
                 from agent.context_references import preprocess_context_references
@@ -7222,6 +7251,11 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             def _stream(delta):
                 with session["history_lock"]:
                     _append_inflight_delta(session, delta)
+                if streaming_tts_active and tts_text_queue is not None:
+                    try:
+                        tts_text_queue.put(delta)
+                    except Exception:
+                        pass
                 payload = {"text": delta}
                 if streamer and (r := streamer.feed(delta)) is not None:
                     payload["rendered"] = r
@@ -7407,23 +7441,22 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 except Exception:
                     pass
 
-            # CLI parity: when voice-mode TTS is on, speak the agent reply
-            # (cli.py:_voice_speak_response).  Only the final text — tool
-            # calls / reasoning already stream separately and would be
-            # noisy to read aloud.
+            # Voice TTS for TUI normally speaks from the live message.delta
+            # stream above so Kokoro/OpenAI-compatible backends can start
+            # during generation. If that stream worker could not start, keep
+            # the old final-response speak_text fallback instead of going
+            # silent.
             if (
                 status == "complete"
                 and isinstance(raw, str)
                 and raw.strip()
                 and _voice_tts_enabled()
+                and not streaming_tts_active
             ):
                 try:
                     from hermes_cli.voice import speak_text
 
-                    spoken = raw
-                    threading.Thread(
-                        target=speak_text, args=(spoken,), daemon=True
-                    ).start()
+                    threading.Thread(target=speak_text, args=(raw,), daemon=True).start()
                 except ImportError:
                     logger.warning("voice TTS skipped: hermes_cli.voice unavailable")
                 except Exception as e:
@@ -7447,6 +7480,28 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
             )
             _emit("error", sid, {"message": str(e)})
         finally:
+            if streaming_tts_active and tts_text_queue is not None:
+                try:
+                    tts_text_queue.put(None)
+                except Exception:
+                    pass
+            if tts_thread is not None:
+                def _cleanup_streaming_tts_thread(
+                    thread: threading.Thread = tts_thread,
+                    stop_event: Any = tts_stop_event,
+                ) -> None:
+                    try:
+                        thread.join()
+                    except Exception:
+                        pass
+                    with session["history_lock"]:
+                        if session.get("_voice_tts_stop_event") is stop_event:
+                            session.pop("_voice_tts_stop_event", None)
+
+                if tts_thread.is_alive():
+                    threading.Thread(target=_cleanup_streaming_tts_thread, daemon=True).start()
+                else:
+                    _cleanup_streaming_tts_thread()
             try:
                 if approval_token is not None:
                     reset_current_session_key(approval_token)
@@ -10713,6 +10768,22 @@ def _voice_tts_enabled() -> bool:
     return os.environ.get("HERMES_VOICE_TTS", "").strip() == "1"
 
 
+def _stop_session_streaming_tts(session: dict) -> None:
+    """Stop any voice readback owned by a TUI session."""
+    stop_event = session.get("_voice_tts_stop_event")
+    if stop_event is not None:
+        try:
+            stop_event.set()
+        except Exception:
+            pass
+    try:
+        from tools.voice_mode import stop_playback
+
+        stop_playback()
+    except Exception:
+        pass
+
+
 def _voice_cfg_dict() -> dict:
     """Shape-safe accessor for the ``voice:`` block in config.yaml.
 
@@ -10735,6 +10806,15 @@ def _voice_record_key() -> str:
     record_key = _voice_cfg_dict().get("record_key")
 
     return str(record_key) if isinstance(record_key, str) and record_key else "ctrl+b"
+
+
+def _voice_transcript_mode() -> str:
+    """Current transcript handling mode: ``send`` or ``draft``."""
+    raw = _voice_cfg_dict().get("transcript_mode")
+    mode = str(raw).strip().lower() if isinstance(raw, str) else ""
+    if mode in {"draft", "edit", "compose"}:
+        return "draft"
+    return "send"
 
 
 @method("voice.toggle")
@@ -10882,10 +10962,14 @@ def _(rid, params: dict) -> dict:
                 else 3.0
             )
             started = start_continuous(
-                on_transcript=lambda t: _voice_emit("voice.transcript", {"text": t}),
+                on_transcript=lambda t: _voice_emit(
+                    "voice.transcript",
+                    {"text": t, "transcript_mode": _voice_transcript_mode()},
+                ),
                 on_status=lambda s: _voice_emit("voice.status", {"state": s}),
                 on_silent_limit=lambda: _voice_emit(
-                    "voice.transcript", {"no_speech_limit": True}
+                    "voice.transcript",
+                    {"no_speech_limit": True, "transcript_mode": _voice_transcript_mode()},
                 ),
                 silence_threshold=safe_threshold,
                 silence_duration=safe_duration,

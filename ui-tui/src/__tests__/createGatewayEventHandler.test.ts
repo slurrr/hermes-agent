@@ -58,6 +58,20 @@ const buildCtx = (appended: Msg[]) =>
   }) as any
 
 describe('createGatewayEventHandler', () => {
+  it('drafts voice transcripts when gateway marks transcript_mode draft', () => {
+    const appended: Msg[] = []
+    const ctx = buildCtx(appended)
+    const onEvent = createGatewayEventHandler(ctx)
+
+    onEvent({ payload: { text: 'hello from stt', transcript_mode: 'draft' }, type: 'voice.transcript' } as any)
+
+    expect(ctx.composer.setInput).toHaveBeenCalledTimes(1)
+    const updater = ctx.composer.setInput.mock.calls[0][0] as (current: string) => string
+    expect(updater('existing')).toBe('existing hello from stt')
+    expect(ctx.submission.submitRef.current).not.toHaveBeenCalled()
+    expect(ctx.system.sys).toHaveBeenCalledWith('voice: transcript drafted — edit, then Enter to send')
+  })
+
   beforeEach(() => {
     resetOverlayState()
     resetUiState()

@@ -1022,12 +1022,28 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
     oai_config = tts_config.get("openai", {})
     model = oai_config.get("model", DEFAULT_OPENAI_MODEL)
     voice = oai_config.get("voice", DEFAULT_OPENAI_VOICE)
+    api_key = oai_config.get("api_key") or api_key
     base_url = oai_config.get("base_url", base_url)
     speed = float(oai_config.get("speed", tts_config.get("speed", 1.0)))
 
-    # Determine response format from extension
-    if output_path.endswith(".ogg"):
+    # Determine response format from config first, then extension.
+    configured_format = str(
+        oai_config.get("response_format")
+        or oai_config.get("output_format")
+        or ""
+    ).strip().lower()
+    if configured_format:
+        response_format = configured_format
+    elif output_path.endswith(".ogg"):
         response_format = "opus"
+    elif output_path.endswith(".wav"):
+        response_format = "wav"
+    elif output_path.endswith(".aac"):
+        response_format = "aac"
+    elif output_path.endswith(".flac"):
+        response_format = "flac"
+    elif output_path.endswith(".pcm"):
+        response_format = "pcm"
     else:
         response_format = "mp3"
 
@@ -1043,6 +1059,13 @@ def _generate_openai_tts(text: str, output_path: str, tts_config: Dict[str, Any]
         }
         if speed != 1.0:
             create_kwargs["speed"] = max(0.25, min(4.0, speed))
+        extra_body = oai_config.get("extra_body") if isinstance(oai_config, dict) else None
+        if not isinstance(extra_body, dict):
+            extra_body = {}
+        if oai_config.get("profile") and "profile" not in extra_body:
+            extra_body["profile"] = oai_config.get("profile")
+        if extra_body:
+            create_kwargs["extra_body"] = extra_body
         response = client.audio.speech.create(**create_kwargs)
 
         response.stream_to_file(output_path)
@@ -2214,6 +2237,17 @@ def text_to_speech_tool(
         if command_provider_config is not None:
             fmt = _get_command_tts_output_format(command_provider_config)
             file_path = out_dir / f"tts_{timestamp}.{fmt}"
+        elif provider == "openai":
+            openai_cfg = tts_config.get("openai", {}) if isinstance(tts_config, dict) else {}
+            fmt = str(
+                openai_cfg.get("response_format")
+                or openai_cfg.get("output_format")
+                or "mp3"
+            ).strip().lower()
+            ext = {"opus": "ogg", "pcm": "pcm"}.get(fmt, fmt)
+            if ext not in {"mp3", "wav", "ogg", "aac", "flac", "pcm"}:
+                ext = "mp3"
+            file_path = out_dir / f"tts_{timestamp}.{ext}"
         # Use .ogg for Telegram with providers that support native Opus output,
         # otherwise fall back to .mp3 (Edge TTS will attempt ffmpeg conversion later).
         elif want_opus and provider in {"openai", "elevenlabs", "mistral", "gemini"}:
@@ -2506,6 +2540,13 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
     When ``tts.use_gateway`` is set in config, the Tool Gateway is preferred
     even if direct OpenAI credentials are present.
     """
+    try:
+        openai_cfg = _load_tts_config().get("openai", {})
+        if isinstance(openai_cfg, dict) and openai_cfg.get("api_key") and not prefers_gateway("tts"):
+            return str(openai_cfg.get("api_key")), str(openai_cfg.get("base_url") or DEFAULT_OPENAI_BASE_URL)
+    except Exception:
+        pass
+
     direct_api_key = resolve_openai_audio_api_key()
     if direct_api_key and not prefers_gateway("tts"):
         return direct_api_key, DEFAULT_OPENAI_BASE_URL
@@ -2529,6 +2570,12 @@ def _resolve_openai_audio_client_config() -> tuple[str, str]:
 
 def _has_openai_audio_backend() -> bool:
     """Return True when OpenAI audio can use direct credentials or the managed gateway."""
+    try:
+        openai_cfg = _load_tts_config().get("openai", {})
+        if isinstance(openai_cfg, dict) and openai_cfg.get("api_key"):
+            return True
+    except Exception:
+        pass
     return bool(resolve_openai_audio_api_key() or resolve_managed_tool_gateway("openai-audio"))
 
 
@@ -2572,97 +2619,184 @@ def stream_tts_to_speaker(
     tts_done_event: threading.Event,
     display_callback: Optional[Callable[[str], None]] = None,
 ):
-    """Consume text deltas from *text_queue*, buffer them into sentences,
-    and stream each sentence through ElevenLabs TTS to the speaker in
-    real-time.
+    """Consume streamed text deltas and speak them one chunk at a time.
 
-    Protocol:
-        * The producer puts ``str`` deltas onto *text_queue*.
-        * A ``None`` sentinel signals end-of-text (flush remaining buffer).
-        * *stop_event* can be set to abort early (e.g. user interrupt).
-        * *tts_done_event* is **set** in the ``finally`` block so callers
-          waiting on it (continuous voice mode) know playback is finished.
+    ElevenLabs uses its native chunk iterator. OpenAI-compatible providers
+    (including local Kokoro) are handled sentence-by-sentence: each completed
+    text chunk is sent to ``text_to_speech_tool`` with a temporary WAV output,
+    then played before the next chunk is synthesized. This gives a streaming
+    voice-loop feel even when the TTS backend itself is request/response only.
     """
     tts_done_event.clear()
+    output_stream = None
 
     try:
-        # --- TTS client setup (optional -- display_callback works without it) ---
+        tts_config = _load_tts_config()
+        provider = _get_provider(tts_config)
         client = None
-        output_stream = None
         voice_id = DEFAULT_ELEVENLABS_VOICE_ID
         model_id = DEFAULT_ELEVENLABS_STREAMING_MODEL_ID
+        stream_max_len = _resolve_max_text_length(provider, tts_config)
 
-        tts_config = _load_tts_config()
-        el_config = tts_config.get("elevenlabs", {})
-        voice_id = el_config.get("voice_id", voice_id)
-        model_id = el_config.get("streaming_model_id",
-                                 el_config.get("model_id", model_id))
-        # Per-sentence cap for the streaming path. Look up the cap against
-        # the *streaming* model_id (defaults to eleven_flash_v2_5 = 40k chars),
-        # not the sync model_id. A user override
-        # (tts.elevenlabs.max_text_length) still wins.
-        stream_max_len = _resolve_max_text_length(
-            "elevenlabs",
-            {**tts_config, "elevenlabs": {**el_config, "model_id": model_id}},
-        )
-
-        api_key = (get_env_value("ELEVENLABS_API_KEY") or "")
-        if not api_key:
-            logger.warning("ELEVENLABS_API_KEY not set; streaming TTS audio disabled")
-        else:
-            try:
-                ElevenLabs = _import_elevenlabs()
-                client = ElevenLabs(api_key=api_key)
-            except ImportError:
-                logger.warning("elevenlabs package not installed; streaming TTS disabled")
-
-            # Open a single sounddevice output stream for the lifetime of
-            # this function.  ElevenLabs pcm_24000 produces signed 16-bit
-            # little-endian mono PCM at 24 kHz.
-            if client is not None:
+        if provider == "elevenlabs":
+            el_config = tts_config.get("elevenlabs", {})
+            voice_id = el_config.get("voice_id", voice_id)
+            model_id = el_config.get("streaming_model_id", el_config.get("model_id", model_id))
+            stream_max_len = _resolve_max_text_length(
+                "elevenlabs",
+                {**tts_config, "elevenlabs": {**el_config, "model_id": model_id}},
+            )
+            api_key = (get_env_value("ELEVENLABS_API_KEY") or "")
+            if not api_key:
+                logger.warning("ELEVENLABS_API_KEY not set; streaming TTS audio disabled")
+            else:
                 try:
-                    sd = _import_sounddevice()
-                    output_stream = sd.OutputStream(
-                        samplerate=24000, channels=1, dtype="int16",
-                    )
-                    output_stream.start()
-                except (ImportError, OSError) as exc:
-                    logger.debug("sounddevice not available: %s", exc)
-                    output_stream = None
-                except Exception as exc:
-                    logger.warning("sounddevice OutputStream failed: %s", exc)
-                    output_stream = None
+                    ElevenLabs = _import_elevenlabs()
+                    client = ElevenLabs(api_key=api_key)
+                except ImportError:
+                    logger.warning("elevenlabs package not installed; streaming TTS disabled")
+
+                if client is not None:
+                    try:
+                        sd = _import_sounddevice()
+                        output_stream = sd.OutputStream(samplerate=24000, channels=1, dtype="int16")
+                        output_stream.start()
+                    except (ImportError, OSError) as exc:
+                        logger.debug("sounddevice not available: %s", exc)
+                        output_stream = None
+                    except Exception as exc:
+                        logger.warning("sounddevice OutputStream failed: %s", exc)
+                        output_stream = None
+        elif provider == "openai":
+            # The regular text_to_speech_tool path owns credentials, base_url,
+            # profile, response_format, provider-specific max length, etc.
+            client = "openai-compatible"
+        else:
+            logger.warning("Streaming TTS is not implemented for provider '%s'", provider)
 
         sentence_buf = ""
         min_sentence_len = 20
-        long_flush_len = 100
-        queue_timeout = 0.5
-        _spoken_sentences: list[str] = []  # track spoken sentences to skip duplicates
-        # Regex to strip complete <think>...</think> blocks from buffer
+        long_flush_len = 140
+        queue_timeout = 0.35
+        _spoken_sentences: list[str] = []
         _think_block_re = re.compile(r'<think[\s>].*?</think>', flags=re.DOTALL)
 
+        def _next_boundary(buf: str) -> Optional[int]:
+            """Return the next natural chunk boundary, or None.
+
+            Priority:
+              1. sentence punctuation followed by whitespace/newline
+              2. blank lines
+              3. single newline when the line is substantial enough
+              4. long comma/semicolon/dash clauses as a latency fallback
+            """
+            if not buf:
+                return None
+
+            punct = re.search(r'(?<=[.!?])(?:["\')\]]+)?(?:\s+|\n+)', buf)
+            candidates: list[int] = []
+            if punct:
+                candidates.append(punct.end())
+
+            blank = re.search(r'\n\s*\n+', buf)
+            if blank:
+                candidates.append(blank.end())
+
+            for m in re.finditer(r'\n+', buf):
+                segment = buf[:m.start()].strip()
+                # Newline-only chunks are useful for model output that formats
+                # thoughts/lists without punctuation. Avoid tiny fragments like
+                # a lone bullet label.
+                if len(segment) >= min_sentence_len:
+                    candidates.append(m.end())
+                    break
+
+            if len(buf) >= long_flush_len:
+                # Prefer a soft clause break after enough text, otherwise split
+                # at the last whitespace before long_flush_len.
+                window = buf[:long_flush_len]
+                soft = max(window.rfind(", "), window.rfind("; "), window.rfind(": "), window.rfind(" — "), window.rfind(" - "))
+                if soft >= min_sentence_len:
+                    candidates.append(soft + 2)
+                else:
+                    ws = window.rfind(" ")
+                    candidates.append(ws + 1 if ws >= min_sentence_len else long_flush_len)
+
+            return min(candidates) if candidates else None
+
+        def _play_via_tempfile(audio_iter, stop_evt):
+            tmp_path = None
+            try:
+                import wave
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp_path = tmp.name
+                with wave.open(tmp, "wb") as wf:
+                    wf.setnchannels(1)
+                    wf.setsampwidth(2)
+                    wf.setframerate(24000)
+                    for chunk in audio_iter:
+                        if stop_evt.is_set():
+                            break
+                        wf.writeframes(chunk)
+                if not stop_evt.is_set():
+                    from tools.voice_mode import play_audio_file
+                    play_audio_file(tmp_path)
+            except Exception as exc:
+                logger.warning("Temp-file TTS fallback failed: %s", exc)
+            finally:
+                if tmp_path:
+                    try:
+                        os.unlink(tmp_path)
+                    except OSError:
+                        pass
+
+        def _speak_openai_compatible(cleaned: str) -> None:
+            tmp_path = None
+            try:
+                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                tmp_path = tmp.name
+                tmp.close()
+                result = json.loads(text_to_speech_tool(cleaned, output_path=tmp_path))
+                if stop_event.is_set():
+                    return
+                if not result.get("success"):
+                    logger.warning("Streaming OpenAI-compatible TTS failed: %s", result.get("error"))
+                    return
+                audio_path = result.get("file_path") or tmp_path
+                from tools.voice_mode import play_audio_file
+                play_audio_file(str(audio_path))
+            except Exception as exc:
+                logger.warning("Streaming OpenAI-compatible TTS sentence failed: %s", exc)
+            finally:
+                for candidate in {tmp_path}:
+                    if candidate:
+                        try:
+                            os.unlink(candidate)
+                        except OSError:
+                            pass
+
         def _speak_sentence(sentence: str):
-            """Display sentence and optionally generate + play audio."""
             if stop_event.is_set():
                 return
             cleaned = _strip_markdown_for_tts(sentence).strip()
             if not cleaned:
                 return
-            # Skip duplicate/near-duplicate sentences (LLM repetition)
             cleaned_lower = cleaned.lower().rstrip(".!,")
             for prev in _spoken_sentences:
                 if prev.lower().rstrip(".!,") == cleaned_lower:
                     return
             _spoken_sentences.append(cleaned)
-            # Display raw sentence on screen before TTS processing
             if display_callback is not None:
                 display_callback(sentence)
-            # Skip audio generation if no TTS client available
             if client is None:
                 return
-            # Truncate very long sentences (ElevenLabs streaming path)
             if len(cleaned) > stream_max_len:
                 cleaned = cleaned[:stream_max_len]
+
+            if provider == "openai":
+                _speak_openai_compatible(cleaned)
+                return
+
             try:
                 audio_iter = client.text_to_speech.convert(
                     text=cleaned,
@@ -2678,94 +2812,55 @@ def stream_tts_to_speaker(
                         audio_array = _np.frombuffer(chunk, dtype=_np.int16)
                         output_stream.write(audio_array.reshape(-1, 1))
                 else:
-                    # Fallback: write chunks to temp file and play via system player
                     _play_via_tempfile(audio_iter, stop_event)
             except Exception as exc:
                 logger.warning("Streaming TTS sentence failed: %s", exc)
 
-        def _play_via_tempfile(audio_iter, stop_evt):
-            """Write PCM chunks to a temp WAV file and play it."""
-            tmp_path = None
-            try:
-                import wave
-                tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                tmp_path = tmp.name
-                with wave.open(tmp, "wb") as wf:
-                    wf.setnchannels(1)
-                    wf.setsampwidth(2)  # 16-bit
-                    wf.setframerate(24000)
-                    for chunk in audio_iter:
-                        if stop_evt.is_set():
-                            break
-                        wf.writeframes(chunk)
-                from tools.voice_mode import play_audio_file
-                play_audio_file(tmp_path)
-            except Exception as exc:
-                logger.warning("Temp-file TTS fallback failed: %s", exc)
-            finally:
-                if tmp_path:
-                    try:
-                        os.unlink(tmp_path)
-                    except OSError:
-                        pass
-
         while not stop_event.is_set():
-            # Read next delta from queue
             try:
                 delta = text_queue.get(timeout=queue_timeout)
             except queue.Empty:
-                # Timeout: if we have accumulated a long buffer, flush it
-                if len(sentence_buf) > long_flush_len:
-                    _speak_sentence(sentence_buf)
-                    sentence_buf = ""
+                boundary = _next_boundary(sentence_buf)
+                if boundary is not None:
+                    sentence = sentence_buf[:boundary]
+                    sentence_buf = sentence_buf[boundary:]
+                    if len(sentence.strip()) >= min_sentence_len:
+                        _speak_sentence(sentence)
+                    else:
+                        sentence_buf = sentence + sentence_buf
                 continue
 
             if delta is None:
-                # End-of-text sentinel: strip any remaining think blocks, flush
                 sentence_buf = _think_block_re.sub('', sentence_buf)
                 if sentence_buf.strip():
                     _speak_sentence(sentence_buf)
                 break
 
             sentence_buf += delta
-
-            # --- Think block filtering ---
-            # Strip complete <think>...</think> blocks from buffer.
-            # Works correctly even when tags span multiple deltas.
             sentence_buf = _think_block_re.sub('', sentence_buf)
-
-            # If an incomplete <think tag is at the end, wait for more data
-            # before extracting sentences (the closing tag may arrive next).
             if '<think' in sentence_buf and '</think>' not in sentence_buf:
                 continue
 
-            # Check for sentence boundaries
             while True:
-                m = _SENTENCE_BOUNDARY_RE.search(sentence_buf)
-                if m is None:
+                boundary = _next_boundary(sentence_buf)
+                if boundary is None:
                     break
-                end_pos = m.end()
-                sentence = sentence_buf[:end_pos]
-                sentence_buf = sentence_buf[end_pos:]
-                # Merge short fragments into the next sentence
+                sentence = sentence_buf[:boundary]
+                sentence_buf = sentence_buf[boundary:]
                 if len(sentence.strip()) < min_sentence_len:
                     sentence_buf = sentence + sentence_buf
                     break
                 _speak_sentence(sentence)
 
-        # Drain any remaining items from the queue
         while True:
             try:
                 text_queue.get_nowait()
             except queue.Empty:
                 break
 
-        # output_stream is closed in the finally block below
-
     except Exception as exc:
         logger.warning("Streaming TTS pipeline error: %s", exc)
     finally:
-        # Always close the audio output stream to avoid locking the device
         if output_stream is not None:
             try:
                 output_stream.stop()
